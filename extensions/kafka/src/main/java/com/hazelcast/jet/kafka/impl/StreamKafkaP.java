@@ -26,6 +26,7 @@ import com.hazelcast.jet.core.EventTimeMapper;
 import com.hazelcast.jet.core.EventTimePolicy;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.kafka.KafkaProcessors;
+import com.hazelcast.jet.kafka.TopicsConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -42,7 +43,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
-import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -52,6 +52,7 @@ import static com.hazelcast.jet.Util.entry;
 import static com.hazelcast.jet.core.BroadcastKey.broadcastKey;
 import static com.hazelcast.jet.impl.util.LoggingUtil.logFinest;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static java.util.stream.Collectors.toMap;
 
 /**
  * See {@link KafkaProcessors#streamKafkaP}.
@@ -65,9 +66,10 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
     Map<TopicPartition, Integer> currentAssignment = new HashMap<>();
 
     private final Properties properties;
-    private final List<String> topics;
     private final FunctionEx<? super ConsumerRecord<K, V>, ? extends T> projectionFn;
     private final EventTimeMapper<? super T> eventTimeMapper;
+    private final TopicsConfig topicsConfig;
+    private List<String> topics;
     private int totalParallelism;
 
     private KafkaConsumer<K, V> consumer;
@@ -88,14 +90,20 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
             @Nonnull List<String> topics,
             @Nonnull FunctionEx<? super ConsumerRecord<K, V>, ? extends T> projectionFn,
             @Nonnull EventTimePolicy<? super T> eventTimePolicy
+    )  {
+        this(properties, projectionFn, eventTimePolicy, new TopicsConfig().addTopics(topics));
+    }
+
+    public StreamKafkaP(
+            @Nonnull Properties properties,
+            @Nonnull FunctionEx<? super ConsumerRecord<K, V>, ? extends T> projectionFn,
+            @Nonnull EventTimePolicy<? super T> eventTimePolicy,
+            @Nonnull TopicsConfig topicsConfig
     ) {
         this.properties = properties;
-        this.topics = topics;
         this.projectionFn = projectionFn;
-        eventTimeMapper = new EventTimeMapper<>(eventTimePolicy);
-        for (String topic : topics) {
-            offsets.put(topic, new long[0]);
-        }
+        this.eventTimeMapper = new EventTimeMapper<>(eventTimePolicy);
+        this.topicsConfig = topicsConfig;
     }
 
     @Override
@@ -105,6 +113,10 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
 
     @Override
     protected void init(@Nonnull Context context) {
+        topics = new ArrayList<>(topicsConfig.getTopicNames());
+        for (String topic : topics) {
+            offsets.put(topic, new long[0]);
+        }
         processorIndex = context.globalProcessorIndex();
         totalParallelism = context.totalParallelism();
         consumer = new KafkaConsumer<>(properties);
@@ -155,7 +167,10 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
         getLogger().info("New partition(s) assigned: " + newAssignments);
         eventTimeMapper.addPartitions(newAssignments.size());
         consumer.assign(currentAssignment.keySet());
-        if (oldTopicOffsets.length > 0 && !isRestoring) {
+        if (oldTopicOffsets.length == 0 && !isRestoring) {
+            // Attempt to initialize partitions offsets only when processor is starting.
+            initializeOffsetsAndSeek(topicName, newAssignments);
+        } else if (oldTopicOffsets.length > 0 && !isRestoring) {
             // For partitions detected later during the runtime we seek to their
             // beginning. It can happen that a partition is added, and some messages
             // are added to it before we start consuming from it. If we started at the
@@ -165,6 +180,24 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
             consumer.seekToBeginning(newAssignments);
         }
         logFinest(getLogger(), "Currently assigned partitions: %s", currentAssignment);
+    }
+
+    private void initializeOffsetsAndSeek(String topicName, Collection<TopicPartition> newAssignments) {
+        for (TopicPartition newAssignment : newAssignments) {
+            int partition = newAssignment.partition();
+            Long initialOffset = topicsConfig.getInitialOffsetFor(topicName, partition);
+            if (initialOffset == null || initialOffset <= 0) {
+                continue;
+            }
+            long[] topicOffsets = offsets.get(topicName);
+            if (topicOffsets == null || topicOffsets.length < partition) {
+                continue;
+            }
+            topicOffsets[partition] = initialOffset;
+            getLogger().info("Seeking to specified initial offset: "
+                    + initialOffset + " of topic partition: " + newAssignment);
+            consumer.seek(newAssignment, initialOffset);
+        }
     }
 
     @Override
@@ -236,7 +269,7 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
                 Entry<BroadcastKey<?>, ?> partitionCountsItem = entry(
                         broadcastKey(PARTITION_COUNTS_SNAPSHOT_KEY),
                         topics.stream()
-                              .collect(Collectors.toMap(topic -> topic, topic -> offsets.get(topic).length)));
+                              .collect(toMap(topic -> topic, topic -> offsets.get(topic).length)));
                 snapshotTraverser = snapshotTraverser.append(partitionCountsItem);
             }
         }
@@ -299,22 +332,22 @@ public final class StreamKafkaP<K, V, T> extends AbstractProcessor {
 
     private Map<TopicPartition, Long> offsets() {
         return currentAssignment.keySet().stream()
-                .collect(Collectors.toMap(tp -> tp, tp -> offsets.get(tp.topic())[tp.partition()]));
+                .collect(toMap(tp -> tp, tp -> offsets.get(tp.topic())[tp.partition()]));
     }
 
     private Map<TopicPartition, Long> watermarks() {
         return currentAssignment.entrySet().stream()
-                .collect(Collectors.toMap(Entry::getKey, e -> eventTimeMapper.getWatermark(e.getValue())));
+                .collect(toMap(Entry::getKey, e -> eventTimeMapper.getWatermark(e.getValue())));
     }
 
     @Nonnull
     public static <K, V, T> SupplierEx<Processor> processorSupplier(
             @Nonnull Properties properties,
-            @Nonnull List<String> topics,
+            @Nonnull TopicsConfig topicsConfig,
             @Nonnull FunctionEx<? super ConsumerRecord<K, V>, ? extends T> projectionFn,
             @Nonnull EventTimePolicy<? super T> eventTimePolicy
     ) {
-        return () -> new StreamKafkaP<>(properties, topics, projectionFn, eventTimePolicy);
+        return () -> new StreamKafkaP<>(properties, projectionFn, eventTimePolicy, topicsConfig);
     }
 
     private boolean handledByThisProcessor(int topicIndex, int partition) {

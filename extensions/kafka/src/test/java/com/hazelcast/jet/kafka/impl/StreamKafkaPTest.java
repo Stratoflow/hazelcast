@@ -33,9 +33,12 @@ import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.impl.JobExecutionRecord;
 import com.hazelcast.jet.impl.JobRepository;
 import com.hazelcast.jet.kafka.KafkaSources;
+import com.hazelcast.jet.kafka.TopicsConfig;
+import com.hazelcast.jet.kafka.TopicsConfig.TopicConfig;
 import com.hazelcast.jet.pipeline.Pipeline;
 import com.hazelcast.jet.pipeline.Sinks;
 import com.hazelcast.test.annotation.ParallelJVMTest;
@@ -70,13 +73,18 @@ import java.util.Set;
 import java.util.concurrent.Future;
 
 import static com.hazelcast.jet.Util.entry;
+import static com.hazelcast.jet.config.ProcessingGuarantee.AT_LEAST_ONCE;
 import static com.hazelcast.jet.config.ProcessingGuarantee.EXACTLY_ONCE;
+import static com.hazelcast.jet.config.ProcessingGuarantee.NONE;
 import static com.hazelcast.jet.core.EventTimePolicy.eventTimePolicy;
 import static com.hazelcast.jet.core.WatermarkPolicy.limitingLag;
 import static com.hazelcast.jet.impl.execution.WatermarkCoalescer.IDLE_MESSAGE;
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.mapping;
+import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
 import static java.util.stream.IntStream.range;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -140,6 +148,159 @@ public class StreamKafkaPTest extends SimpleTestInClusterSupport {
                 assertTrue("missing entry: " + value, list.contains(value));
             }
         }, 5);
+    }
+
+    @Test
+    public void when_partitionsInitialOffsetsProvided_thenRecordsReadFromAppropriatePosition() {
+        for (int i = 0; i < 100; i++) {
+            kafkaTestSupport.produce(topic1Name, i,  String.valueOf(i));
+            kafkaTestSupport.produce(topic2Name, i,  String.valueOf(i));
+        }
+        sleepAtLeastSeconds(3);
+
+        TopicsConfig topicsConfig = new TopicsConfig()
+                .addTopicConfig(new TopicConfig(topic1Name)
+                        // 20 total records will be skipped from topic1
+                        .addPartitionInitialOffset(0, 5L)
+                        .addPartitionInitialOffset(1, 5L)
+                        .addPartitionInitialOffset(2, 5L)
+                        .addPartitionInitialOffset(3, 5L))
+                .addTopicConfig(new TopicConfig(topic2Name)
+                        // 10 total records will be skipped from topic2
+                        .addPartitionInitialOffset(0, 5L)
+                        .addPartitionInitialOffset(2, 5L));
+
+        Pipeline p = Pipeline.create();
+        p.readFrom(KafkaSources.<Integer, String, Tuple2<String, String>>kafka(
+                        properties(), r -> Tuple2.tuple2(r.value(), r.topic()), topicsConfig
+                ))
+                .withoutTimestamps()
+                .writeTo(Sinks.list("sink"));
+
+        instance().getJet().newJob(p);
+        sleepAtLeastSeconds(3);
+
+        IList<Tuple2<String, String>> list = instance().getList("sink");
+        assertTrueEventually(() -> assertEquals(170, list.size()), 5);
+
+        // group retrieved records by topic and check if expected number of records were skipped
+        Map<String, List<String>> recordsByTopic = list.stream()
+                .collect(groupingBy(Tuple2::f1, mapping(Tuple2::f0, toList())));
+
+        assertThat(recordsByTopic.get(topic1Name).size())
+                .isEqualTo(80);
+        assertThat(recordsByTopic.get(topic2Name).size())
+                .isEqualTo(90);
+    }
+
+    @Test
+    public void when_processingGuaranteeNone_thenContinueFromBeginningAfterJobRestart() {
+        TopicsConfig topicsConfig = new TopicsConfig().addTopicConfig(new TopicConfig(topic1Name));
+
+        // 100 messages will be produced before the job is restarted and then another batch of 100 will be produced
+        // after the job is restarted (so there will be 200 messages in total)
+        int messageCount = 100;
+
+        // all messages produced before the job is restarted should be read
+        int expectedCountBeforeRestart = 100;
+
+        // for processing guarantee equal to NONE, when the job is restarted, the initial 100 messages will be
+        // read twice, so total expected number of messages should be: 100 + 200 = 300
+        int expectedCountAfterRestart = 300;
+
+        testWithJobRestart(messageCount, topicsConfig, NONE,
+                expectedCountBeforeRestart, expectedCountAfterRestart);
+    }
+
+    @Test
+    public void when_processingGuaranteeNoneWithInitialOffsets_thenContinueFromBeginningAfterJobRestart() {
+        TopicsConfig topicsConfig = new TopicsConfig()
+                .addTopicConfig(new TopicConfig(topic1Name)
+                        .addPartitionInitialOffset(0, 5L)
+                        .addPartitionInitialOffset(1, 5L)
+                        .addPartitionInitialOffset(2, 5L)
+                        .addPartitionInitialOffset(3, 5L)
+                );
+        int messageCount = 100;
+
+        // 20 messages will be skipped, because of initial offsets' configuration
+        int expectedCountBeforeRestart = 80;
+
+        // restarting the job will result in reading the initial messages twice, but the initial offsets' configuration
+        // will be respected, so total expected number of messages should be: 80 + 180 = 260
+        int expectedCountAfterRestart = 260;
+
+        testWithJobRestart(messageCount, topicsConfig, NONE,
+                expectedCountBeforeRestart, expectedCountAfterRestart);
+    }
+
+    @Test
+    public void when_atLeastOnce_thenContinueFromLastReadMessageAfterJobRestart() {
+        TopicsConfig topicsConfig = new TopicsConfig().addTopicConfig(new TopicConfig(topic1Name));
+        int messageCount = 100;
+        int expectedCountBeforeRestart = 100;
+
+        // for processing guarantee different from NONE, when the job is restarted, consumption should be resumed
+        // from the last successfully consumed message
+        int expectedCountAfterRestart = 200;
+
+        testWithJobRestart(messageCount, topicsConfig, AT_LEAST_ONCE,
+                expectedCountBeforeRestart, expectedCountAfterRestart);
+    }
+
+    @Test
+    public void when_atLeastOnceWithInitialOffsets_thenContinueFromLastReadMessageAfterJobRestart() {
+        TopicsConfig topicsConfig = new TopicsConfig()
+                .addTopicConfig(new TopicConfig(topic1Name)
+                        .addPartitionInitialOffset(0, 5L)
+                        .addPartitionInitialOffset(1, 5L)
+                        .addPartitionInitialOffset(2, 5L)
+                        .addPartitionInitialOffset(3, 5L)
+                );
+        int messageCount = 100;
+
+        // 20 messages will be skipped, because of initial offsets' configuration
+        int expectedCountBeforeRestart = 80;
+
+        // for processing guarantee different from NONE, when the job is restarted, consumption should be resumed
+        // from the last successfully consumed message (i.e. initial offsets' configuration should be ignored while
+        // restoring the job from snapshot)
+        int expectedCountAfterRestart = 180;
+
+        testWithJobRestart(messageCount, topicsConfig, AT_LEAST_ONCE,
+                expectedCountBeforeRestart, expectedCountAfterRestart);
+    }
+
+    private void testWithJobRestart(
+            int messageCount,
+            TopicsConfig topicsConfig,
+            ProcessingGuarantee processingGuarantee,
+            int expectedCountBeforeRestart,
+            int expectedCountAfterRestart
+    ) {
+        for (int i = 0; i < messageCount; i++) {
+            kafkaTestSupport.produce(topic1Name, i, String.valueOf(i));
+        }
+        sleepAtLeastSeconds(3);
+
+        Pipeline p = Pipeline.create();
+        p.readFrom(KafkaSources.<Integer, String, String>kafka(properties(), ConsumerRecord::value, topicsConfig))
+                .withoutTimestamps()
+                .writeTo(Sinks.list("sink"));
+
+        Job job = instance().getJet().newJob(p, new JobConfig().setProcessingGuarantee(processingGuarantee));
+        sleepAtLeastSeconds(3);
+
+        assertTrueEventually(() -> assertEquals(expectedCountBeforeRestart, instance().getList("sink").size()), 5);
+
+        job.restart();
+
+        for (int i = messageCount; i < messageCount * 2; i++) {
+            kafkaTestSupport.produce(topic1Name, i, String.valueOf(i));
+        }
+        sleepAtLeastSeconds(3);
+
+        assertTrueEventually(() -> assertEquals(expectedCountAfterRestart, instance().getList("sink").size()), 5);
     }
 
     @Test
