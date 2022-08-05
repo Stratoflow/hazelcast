@@ -52,10 +52,24 @@ public final class KafkaProcessors {
             @Nonnull EventTimePolicy<? super T> eventTimePolicy,
             @Nonnull String... topics
     ) {
-        Preconditions.checkPositive(topics.length, "At least one topic must be supplied");
+        TopicsConfig topicsConfig = new TopicsConfig().addTopics(Arrays.asList(topics));
+        return streamKafkaP(properties, projectionFn, eventTimePolicy, topicsConfig);
+    }
+
+    /**
+     * Returns a supplier of processors for {@link
+     * KafkaSources#kafka(Properties, FunctionEx, TopicsConfig)}}.
+     */
+    public static <K, V, T> ProcessorMetaSupplier streamKafkaP(
+            @Nonnull Properties properties,
+            @Nonnull FunctionEx<? super ConsumerRecord<K, V>, ? extends T> projectionFn,
+            @Nonnull EventTimePolicy<? super T> eventTimePolicy,
+            @Nonnull TopicsConfig topicsConfig
+    ) {
+        Preconditions.checkPositive(topicsConfig.getTopicNames().size(), "At least one topic must be supplied");
         return ProcessorMetaSupplier.of(
                 PREFERRED_LOCAL_PARALLELISM,
-                StreamKafkaP.processorSupplier(properties, Arrays.asList(topics), projectionFn, eventTimePolicy)
+                StreamKafkaP.processorSupplier(properties, topicsConfig, projectionFn, eventTimePolicy)
         );
     }
 

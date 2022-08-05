@@ -166,9 +166,7 @@ public final class KinesisSources {
 
         private Builder(@Nonnull String stream) {
             this.stream = stream;
-            // Don't use lambda here since serialization/deserialization of the lambda gets corrupted
-            // after relocating aws classes
-            this.projectionFn = new DefaultProjection<>();
+            this.projectionFn = (record, shard) -> (T) entry(record.getPartitionKey(), toArray(record, shard));
         }
 
         /**
@@ -324,18 +322,8 @@ public final class KinesisSources {
                     eventTimePolicy -> new KinesisSourcePMetaSupplier<T>(awsConfig, stream, retryStrategy,
                             initialShardIterators, eventTimePolicy, projectionFn));
         }
-    }
 
-    private static class DefaultProjection<T> implements BiFunctionEx<Record, Shard, T> {
-
-        private static final long serialVersionUID = 1L;
-
-        @Override
-        public T applyEx(Record record, Shard shard) {
-            return (T) entry(record.getPartitionKey(), toArray(record));
-        }
-
-        private static byte[] toArray(Record record) {
+        private static byte[] toArray(Record record, Shard shard) {
             ByteBuffer buffer = record.getData();
             int position = buffer.position();
             int limit = buffer.limit();
@@ -346,4 +334,5 @@ public final class KinesisSources {
             }
         }
     }
+
 }
